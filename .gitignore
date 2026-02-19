@@ -1,0 +1,36 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# C++ / CMake
+build/
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.user
+.vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Logs
+*.log
+bt_debug.txt
+bt_debug_mgr.txt
+bt_debug_mgr_v2.txt
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Misc
+*.tmp
