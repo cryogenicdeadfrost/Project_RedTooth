@@ -22,11 +22,14 @@ public:
     ~DeviceScanner();
 
     // Starts async scanning
-    void StartScanning();
+    bool StartScanning();
     void StopScanning();
 
     std::vector<BluetoothDevice> GetDiscoveredDevices();
     
+    // Check if Bluetooth radio is valid/connectable
+    bool IsValidRadio();
+
     // Callback for new device found
     void SetOnDeviceFoundCallback(std::function<void(const BluetoothDevice&)> callback);
 

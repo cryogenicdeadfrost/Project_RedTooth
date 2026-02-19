@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "DeviceScanner.h"
 #include <thread>
 #include <iostream>
@@ -5,9 +6,22 @@
 #include <algorithm>
 #include <cstdlib>
 #include <ctime>
+#include <vector>
+#include <cstdarg> // For va_list, va_start, va_end
+#include <cstdio> // For vprintf, printf
+#include <chrono> // For std::chrono::milliseconds
 
 #pragma comment(lib, "Bthprops.lib")
 #pragma comment(lib, "Ws2_32.lib")
+
+// Helper for CLI logging
+void LogCLI(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    printf("\n");
+}
 
 DeviceScanner::DeviceScanner() : scanning_(false), scan_thread_(nullptr), on_device_found_(nullptr) {
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
@@ -18,13 +32,16 @@ DeviceScanner::~DeviceScanner() {
 }
 
 bool DeviceScanner::StartScanning() {
+    std::lock_guard<std::mutex> lock(mutex_); // Protect scanning state change
     if (scanning_) return true;
-    
-    FILE* log = fopen("bt_debug.txt", "a");
-    if (log) { 
-        fprintf(log, "[INFO] Starting device scanning...\n"); 
-        fclose(log); 
+
+    // 1. Validate Radio Logic
+    if (!IsValidRadio()) {
+        LogCLI("[ERROR] Bluetooth Radio is not ready or not connectable/discoverable.");
+        return false;
     }
+    
+    LogCLI("[INFO] Starting device scanning...");
     
     scanning_ = true;
     scan_thread_ = CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
@@ -35,85 +52,106 @@ bool DeviceScanner::StartScanning() {
     if (!scan_thread_) {
         DWORD error = GetLastError();
         scanning_ = false;
-        
-        log = fopen("bt_debug.txt", "a");
-        if (log) { 
-            fprintf(log, "[ERROR] CreateThread failed: %d\n", error); 
-            fclose(log); 
-        }
+        LogCLI("[ERROR] CreateThread failed: %lu", error);
         return false;
     }
     
-    log = fopen("bt_debug.txt", "a");
-    if (log) { 
-        fprintf(log, "[INFO] Scan thread created successfully\n"); 
-        fclose(log); 
-    }
-    
+    LogCLI("[INFO] Scan thread created successfully");
     return true;
 }
 
 void DeviceScanner::StopScanning() {
-    scanning_ = false;
+    // Determine if we need to stop
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!scanning_) return;
+        scanning_ = false;
+    }
+
+    // Wait outside the lock to avoid deadlock if ScanLoop tries to acquire it
     if (scan_thread_) {
+        LogCLI("[INFO] Waiting for scan thread to stop...");
         WaitForSingleObject(scan_thread_, INFINITE);
         CloseHandle(scan_thread_);
         scan_thread_ = nullptr;
+        LogCLI("[INFO] Scan thread stopped.");
     }
 }
 
 std::vector<BluetoothDevice> DeviceScanner::GetDiscoveredDevices() {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<BluetoothDevice> copy = cached_devices_;
-    return copy;
+    return cached_devices_;
 }
 
-void DeviceScanner::SetOnDeviceFoundCallback(DeviceFoundCallback callback) {
+void DeviceScanner::SetOnDeviceFoundCallback(std::function<void(const BluetoothDevice&)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     on_device_found_ = callback;
 }
 
-void DeviceScanner::ScanLoop() {
-    BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = {
-        sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS),
-        1, // fReturnAuthenticated
-        1, // fReturnRemembered
-        1, // fReturnUnknown
-        1, // fIssueInquiry
-        2, // cTimeoutMultiplier
-        NULL
-    };
+bool DeviceScanner::IsValidRadio() {
+    BLUETOOTH_FIND_RADIO_PARAMS radioParams = { sizeof(BLUETOOTH_FIND_RADIO_PARAMS) };
+    HANDLE hRadio = NULL;
+    HBLUETOOTH_RADIO_FIND hFind = BluetoothFindFirstRadio(&radioParams, &hRadio);
 
-    BLUETOOTH_DEVICE_INFO deviceInfo = { sizeof(BLUETOOTH_DEVICE_INFO), 0 };
-    
-    FILE* log = fopen("bt_debug.txt", "w");
-    if (log) { 
-        fprintf(log, "[INFO] ScanLoop started\n"); 
-        fclose(log); 
+    if (hFind) {
+        BluetoothFindRadioClose(hFind);
+        if (hRadio) {
+            BLUETOOTH_RADIO_INFO radioInfo = { sizeof(BLUETOOTH_RADIO_INFO) };
+            DWORD ret = BluetoothGetRadioInfo(hRadio, &radioInfo);
+            CloseHandle(hRadio);
+            
+            if (ret == ERROR_SUCCESS) {
+                // LogCLI("[INFO] Radio Found: %S", radioInfo.szName);
+                if (BluetoothIsConnectable(hRadio) && BluetoothIsDiscoverable(hRadio)) {
+                     return true;
+                } else {
+                    // LogCLI("[WARN] Radio found but not Connectable/Discoverable.");
+                    // In strict mode this might return false, but often "Connectable" is enough.
+                    // For now, if we found a radio, we assume we can try to scan.
+                    return true; 
+                }
+            }
+        }
     }
+    return false; // No radio handle means no access or no hardware
+}
+
+void DeviceScanner::ScanLoop() {
+    BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams;
+    ZeroMemory(&searchParams, sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS));
+    searchParams.dwSize = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS);
+    searchParams.fReturnAuthenticated = TRUE;
+    searchParams.fReturnRemembered = TRUE;
+    searchParams.fReturnUnknown = TRUE;
+    searchParams.fReturnConnected = TRUE;
+    searchParams.fIssueInquiry = TRUE;
+    searchParams.cTimeoutMultiplier = 4; // ~5 seconds
+    searchParams.hRadio = NULL;
+
+    BLUETOOTH_DEVICE_INFO deviceInfo;
+    ZeroMemory(&deviceInfo, sizeof(BLUETOOTH_DEVICE_INFO));
+    deviceInfo.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
+    
+    LogCLI("[INFO] ScanLoop started");
 
     int consecutive_errors = 0;
-    const int max_backoff_ms = 30000; // 30 seconds max backoff
-    int current_backoff_ms = 2000; // Start with 2 seconds
+    const int max_backoff_ms = 10000;
+    int current_backoff_ms = 1000;
     
-    while (scanning_) {
-        log = fopen("bt_debug.txt", "a");
-        if (log) { 
-            fprintf(log, "[INFO] Starting BluetoothFindFirstDevice... (backoff: %dms)\n", current_backoff_ms); 
-            fclose(log); 
+    while (true) {
+        // Check scanning status safely
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!scanning_) break;
         }
+
+        LogCLI("[INFO] Scanning cycle starting...");
 
         HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&searchParams, &deviceInfo);
         
         if (hFind) {
             consecutive_errors = 0;
-            current_backoff_ms = 2000; // Reset to normal interval
-            
-            log = fopen("bt_debug.txt", "a");
-            if (log) { 
-                fprintf(log, "[INFO] Device found: first\n"); 
-                fclose(log); 
-            }
+            current_backoff_ms = 1000;
             
             int device_count = 0;
             do {
@@ -123,20 +161,23 @@ void DeviceScanner::ScanLoop() {
                 dev.connected = deviceInfo.fConnected;
                 dev.authenticated = deviceInfo.fAuthenticated;
                 dev.cod = deviceInfo.ulClassofDevice;
-                dev.rssi = 0; 
+                dev.rssi = 0; // Windows API doesn't give RSSI easily in this struct without Winsock
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     bool exists = false;
                     for (auto& existing : cached_devices_) {
                         if (existing.address.ullLong == dev.address.ullLong) {
-                            existing = dev; // Update
+                            existing.name = dev.name; // Update name
+                            existing.connected = dev.connected;
+                            existing.authenticated = dev.authenticated;
                             exists = true;
                             break;
                         }
                     }
                     if (!exists) {
                         cached_devices_.push_back(dev);
+                        // LogCLI("[CLI] Device Found: %S", dev.name.c_str()); // C++ CLI Echo
                         if (on_device_found_) {
                             on_device_found_(dev);
                         }
@@ -146,56 +187,32 @@ void DeviceScanner::ScanLoop() {
             } while (BluetoothFindNextDevice(hFind, &deviceInfo));
             
             BluetoothFindDeviceClose(hFind);
-            
-            log = fopen("bt_debug.txt", "a");
-            if (log) { 
-                fprintf(log, "[INFO] Found %d new devices in this scan cycle\n", device_count); 
-                fclose(log); 
-            }
+            // LogCLI("[INFO] Scan cycle matched %d devices.", device_count);
         } else {
             int err = GetLastError();
-            consecutive_errors++;
-            
-            // Exponential backoff with jitter
-            if (consecutive_errors > 1) {
-                current_backoff_ms = std::min(current_backoff_ms * 2, max_backoff_ms);
-                // Add jitter (±20%)
-                int jitter = (rand() % (current_backoff_ms / 5)) - (current_backoff_ms / 10);
-                current_backoff_ms = std::max(1000, current_backoff_ms + jitter);
-            }
-            
-            log = fopen("bt_debug.txt", "a");
-            if (log) { 
-                fprintf(log, "[ERROR] BluetoothFindFirstDevice failed. Error: %d (consecutive errors: %d, next backoff: %dms)\n", 
-                        err, consecutive_errors, current_backoff_ms); 
-                fclose(log); 
-            }
-            
-            // Log specific error messages for common errors
-            if (err == 160) { // ERROR_BAD_DEVICE
-                log = fopen("bt_debug.txt", "a");
-                if (log) { 
-                    fprintf(log, "[WARN] Error 160: Bluetooth radio may be turned off or not available\n"); 
-                    fclose(log); 
-                }
-            } else if (err == 1168) { // ERROR_NOT_FOUND
-                log = fopen("bt_debug.txt", "a");
-                if (log) { 
-                    fprintf(log, "[INFO] Error 1168: No Bluetooth devices found in range\n"); 
-                    fclose(log); 
+            if (err == ERROR_NO_MORE_ITEMS) {
+                // No devices found, this is normal
+            } else {
+                consecutive_errors++;
+                LogCLI("[WARN] BluetoothFindFirstDevice failed or empty. Error: %d", err);
+                
+                if (consecutive_errors > 2) {
+                     current_backoff_ms = (std::min)(current_backoff_ms * 2, max_backoff_ms);
+                     // Add jitter (±20%)
+                     int jitter = (rand() % (current_backoff_ms / 5)) - (current_backoff_ms / 10);
+                     current_backoff_ms = (std::max)(1000, current_backoff_ms + jitter);
                 }
             }
         }
         
-        log = fopen("bt_debug.txt", "a");
-        if (log) { 
-            fprintf(log, "[INFO] Scan cycle finished. Sleeping for %dms...\n", current_backoff_ms); 
-            fclose(log); 
-        }
-        
-        // Wait with backoff before next scan cycle
-        for (int i = 0; i < current_backoff_ms && scanning_; i += 100) {
-            Sleep(100);
+        // Sleep interruptible? 
+        // For simplicity, sleep in chunks
+        for (int i = 0; i < current_backoff_ms; i += 100) {
+             std::lock_guard<std::mutex> lock(mutex_);
+             if (!scanning_) break;
+             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Use std::this_thread::sleep_for
         }
     }
+    
+    LogCLI("[INFO] ScanLoop exited.");
 }

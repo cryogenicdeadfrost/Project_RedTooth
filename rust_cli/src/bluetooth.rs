@@ -2,7 +2,10 @@ use crate::error::{AppError, Result};
 use crate::ffi;
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex};
-use log::{error, info, warn};
+use std::sync::mpsc::{self, Receiver, Sender};
+use log::{error, info};
+
+// ---- Data Structures ----
 
 #[derive(Clone, Debug)]
 pub struct BluetoothDevice {
@@ -14,11 +17,24 @@ pub struct BluetoothDevice {
     pub cod: u32,
 }
 
-// Global state for callback to verify/update
-lazy_static::lazy_static! {
-    pub static ref DISCOVERED_DEVICES: Arc<Mutex<Vec<BluetoothDevice>>> = Arc::new(Mutex::new(Vec::new()));
-    static ref LAST_ERROR: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+#[derive(Debug, Clone)]
+pub enum BluetoothEvent {
+    DeviceFound(BluetoothDevice),
+    ScanStarted,
+    ScanStopped,
+    Connected(u64),
+    Disconnected(u64),
+    Error(String),
 }
+
+// ---- Global Channel State ----
+// We use a global Sender so the C callback can access it.
+// This Mutex is ONLY for the Sender, not the data. It is locked extremely briefly.
+lazy_static::lazy_static! {
+    static ref EVENT_SENDER: Mutex<Option<Sender<BluetoothEvent>>> = Mutex::new(None);
+}
+
+// ---- FFI Callbacks ----
 
 extern "C" fn on_device_found(device: ffi::DiscoveredDevice) {
     let name = unsafe {
@@ -31,34 +47,17 @@ extern "C" fn on_device_found(device: ffi::DiscoveredDevice) {
 
     let dev = BluetoothDevice {
         address: device.address,
-        name,
+        name: name.clone(),
         connected: device.connected,
         authenticated: device.authenticated,
         rssi: device.rssi,
         cod: device.cod,
     };
 
-    info!("Device found: {} ({})", dev.name, dev.address);
-    
-    let list = DISCOVERED_DEVICES.clone();
-    match list.lock() {
-        Ok(mut devices) => {
-            let existing = devices.iter_mut().find(|d| d.address == dev.address);
-            if let Some(entry) = existing {
-                *entry = dev.clone();
-                info!("Updated existing device: {}", dev.address);
-            } else {
-                devices.push(dev.clone());
-                info!("Added new device: {} ({})", dev.name, dev.address);
-            }
-        }
-        Err(poisoned) => {
-            error!("Mutex poisoned while updating device list: {:?}", poisoned);
-            // Try to recover by getting the poisoned data
-            let mut devices = poisoned.into_inner();
-            devices.push(dev);
-        }
-    };
+    // CLI ECHO
+    println!("CLI: Device Found: {} ({:X})", dev.name, dev.address);
+
+    send_event(BluetoothEvent::DeviceFound(dev));
 }
 
 extern "C" fn on_error(error_code: ffi::FfiErrorCode, message: *const std::os::raw::c_char) {
@@ -70,129 +69,101 @@ extern "C" fn on_error(error_code: ffi::FfiErrorCode, message: *const std::os::r
         }
     };
     
-    match error_code {
-        ffi::FfiErrorCode::Success => info!("FFI operation successful"),
-        _ => error!("FFI error: {}", error_msg),
-    }
-    
-    // Store the last error
-    if let Ok(mut error) = LAST_ERROR.lock() {
-        *error = error_msg;
+    // CLI ECHO
+    if error_code != ffi::FfiErrorCode::Success {
+        println!("CLI: FFI Error: {}", error_msg);
+        send_event(BluetoothEvent::Error(error_msg));
     }
 }
 
-pub fn init() -> Result<()> {
-    info!("Initializing Bluetooth...");
+fn send_event(event: BluetoothEvent) {
+    if let Ok(guard) = EVENT_SENDER.lock() {
+        if let Some(sender) = &*guard {
+            let _ = sender.send(event);
+        }
+    }
+}
+
+// ---- Public API ----
+
+/// Initializes the Bluetooth subsystem and returns a Receiver for events.
+/// This must be called once.
+pub fn init() -> Result<Receiver<BluetoothEvent>> {
+    println!("CLI: Initializing Bluetooth Manager...");
+    info!("Initializing Bluetooth Manager...");
+
+    let (tx, rx) = mpsc::channel();
+    
+    // Set the global sender
+    {
+        let mut guard = EVENT_SENDER.lock().unwrap();
+        *guard = Some(tx);
+    }
+
     let result = unsafe { ffi::bt_init(on_error) };
     
     match result {
         ffi::FfiErrorCode::Success => {
-            info!("Bluetooth initialized successfully");
-            Ok(())
+            println!("CLI: Bluetooth Initialized Successfully.");
+            Ok(rx)
         }
         _ => {
-            let error_msg = get_last_error();
-            error!("Failed to initialize Bluetooth: {}", error_msg);
-            Err(AppError::bluetooth(&error_msg))
+            println!("CLI: Failed to Initialize Bluetooth.");
+            Err(AppError::bluetooth("Failed to initialize C++ core"))
         }
     }
 }
 
 pub fn start_scan() -> Result<()> {
-    info!("Starting Bluetooth scan...");
+    println!("CLI: Action -> Start Scan");
     let result = unsafe { ffi::bt_start_scan(on_device_found, on_error) };
-    
-    match result {
-        ffi::FfiErrorCode::Success => {
-            info!("Bluetooth scan started successfully");
-            Ok(())
-        }
-        _ => {
-            let error_msg = get_last_error();
-            error!("Failed to start Bluetooth scan: {}", error_msg);
-            Err(AppError::bluetooth(&error_msg))
-        }
+    if result == ffi::FfiErrorCode::Success {
+        send_event(BluetoothEvent::ScanStarted);
+        Ok(())
+    } else {
+        Err(AppError::bluetooth("Failed to start scan"))
     }
 }
 
 pub fn stop_scan() -> Result<()> {
-    info!("Stopping Bluetooth scan...");
+    println!("CLI: Action -> Stop Scan");
     let result = unsafe { ffi::bt_stop_scan() };
-    
-    match result {
-        ffi::FfiErrorCode::Success => {
-            info!("Bluetooth scan stopped successfully");
-            Ok(())
-        }
-        _ => {
-            let error_msg = get_last_error();
-            error!("Failed to stop Bluetooth scan: {}", error_msg);
-            Err(AppError::bluetooth(&error_msg))
-        }
+    if result == ffi::FfiErrorCode::Success {
+        send_event(BluetoothEvent::ScanStopped);
+        Ok(())
+    } else {
+        Err(AppError::bluetooth("Failed to stop scan"))
     }
 }
 
 pub fn connect(address: u64) -> Result<()> {
-    info!("Connecting to device: {}", address);
+    println!("CLI: Action -> Connect to {:X}", address);
     let result = unsafe { ffi::bt_connect_device(address) };
-    
     match result {
         ffi::FfiErrorCode::Success => {
-            info!("Successfully connected to device: {}", address);
-            Ok(())
+             // We don't get an async callback for connection in this simple FFI yet,
+             // so we speculate/send event here or wait for next scan update.
+             // For now, let's assume success triggers an event.
+             send_event(BluetoothEvent::Connected(address));
+             Ok(())
         }
-        ffi::FfiErrorCode::ConnectionFailed => {
-            let error_msg = get_last_error();
-            error!("Connection failed for device {}: {}", address, error_msg);
-            Err(AppError::bluetooth(&format!("Connection failed: {}", error_msg)))
-        }
-        _ => {
-            let error_msg = get_last_error();
-            error!("Failed to connect to device {}: {}", address, error_msg);
-            Err(AppError::bluetooth(&error_msg))
-        }
+        _ => Err(AppError::bluetooth("Connection failed"))
     }
 }
 
 pub fn disconnect(address: u64) -> Result<()> {
-    info!("Disconnecting from device: {}", address);
+    println!("CLI: Action -> Disconnect from {:X}", address);
     let result = unsafe { ffi::bt_disconnect_device(address) };
-    
     match result {
         ffi::FfiErrorCode::Success => {
-            info!("Successfully disconnected from device: {}", address);
-            Ok(())
+             send_event(BluetoothEvent::Disconnected(address));
+             Ok(())
         }
-        _ => {
-            let error_msg = get_last_error();
-            error!("Failed to disconnect from device {}: {}", address, error_msg);
-            Err(AppError::bluetooth(&error_msg))
-        }
-    }
-}
-
-pub fn get_discovered_devices() -> Result<Vec<BluetoothDevice>> {
-    let list = DISCOVERED_DEVICES.clone();
-    match list.lock() {
-        Ok(devices) => {
-            info!("Retrieved {} discovered devices", devices.len());
-            Ok(devices.to_vec())
-        }
-        Err(poisoned) => {
-            error!("Mutex poisoned while getting device list");
-            // Try to recover
-            let devices = poisoned.into_inner();
-            warn!("Recovered {} devices from poisoned mutex", devices.len());
-            Ok(devices)
-        }
-    }
-}
-
-        }
+        _ => Err(AppError::bluetooth("Disconnect failed"))
     }
 }
 
 pub fn check_permission() -> bool {
-    // Check if we have permission to access Bluetooth radio
+    println!("CLI: Action -> Check Permissions");
     unsafe { ffi::bt_check_permission() }
 }

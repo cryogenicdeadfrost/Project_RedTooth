@@ -33,3 +33,10 @@ This will:
 1.  Configure and build the `bt_core` static lib using CMake.
 2.  Link and build the Rust release binary via Cargo.
 3.  Output the binary to `rust_cli/target/release/btmanager.exe`.
+
+## Latest Updates (v0.2.0)
+
+*   **Robust Event-Driven Architecture**: Refactored the Rust frontend to use `mpsc` channels instead of mutex-locked callbacks, eliminating cyclic deadlocks and improving responsiveness.
+*   **Enhanced Error Handling**: Fixed `BluetoothFindFirstDevice` failing with error 160 by correctly initializing search parameters in C++.
+*   **CLI Echo**: Added comprehensive console logging for all device discovery and connection events, enabling headless debugging.
+*   **Radio Validation**: The core now validates Bluetooth radio connectivity and discoverability before attempting scans.
